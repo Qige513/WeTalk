@@ -8,6 +8,9 @@ $(document).ready(function() {
     let users = {};
     let typingUsers = new Set();
     let messageIds = new Set(); // 用于去重消息的 ID
+    let zoomLevel = 1; // 图片缩放级别
+    let isDragging = false;
+    let startX, startY, initialX, initialY;
 
     // 获取随机头像
     function getRandomAvatar() {
@@ -33,7 +36,6 @@ $(document).ready(function() {
                 $('#login').hide();
                 $('#chat').show();
                 $('#login-status').text('');
-                // 立即将自己加入用户列表
                 users[nickname] = avatar;
                 broadcastUserList();
                 updateOnlineUsers();
@@ -59,15 +61,13 @@ $(document).ready(function() {
             return;
         }
         const shareUrl = `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(roomKey)}`;
-        console.log('分享URL:', shareUrl); // 调试日志
+        console.log('分享URL:', shareUrl);
         if (navigator.clipboard && window.isSecureContext) {
             navigator.clipboard.writeText(shareUrl).then(() => {
                 alert('分享链接已复制到剪贴板: ' + shareUrl);
             }).catch(() => {
                 const copied = prompt('复制失败，请手动复制此链接:', shareUrl);
-                if (copied) {
-                    alert('链接已复制!');
-                }
+                if (copied) alert('链接已复制!');
             });
         } else {
             const textArea = document.createElement('textarea');
@@ -79,9 +79,7 @@ $(document).ready(function() {
                 alert('分享链接已复制到剪贴板: ' + shareUrl);
             } catch (err) {
                 const copied = prompt('复制失败，请手动复制此链接:', shareUrl);
-                if (copied) {
-                    alert('链接已复制!');
-                }
+                if (copied) alert('链接已复制!');
             }
             document.body.removeChild(textArea);
         }
@@ -90,9 +88,8 @@ $(document).ready(function() {
     // 发送消息
     $('#send').click(sendMessage);
     $('#message-input').on('keydown', function(e) {
-        if (e.ctrlKey && e.key === 'Enter') {
-            sendMessage();
-        } else if (e.key === 'Enter' && !e.shiftKey) {
+        if (e.ctrlKey && e.key === 'Enter') sendMessage();
+        else if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendMessage();
         }
@@ -102,20 +99,20 @@ $(document).ready(function() {
         const content = $('#message-input').val().trim();
         if (content && client && client.connected) {
             const encrypted = encrypt(content, roomKey);
-            const messageId = Date.now() + '_' + nickname; // 简单生成唯一 ID
+            const messageId = Date.now() + '_' + Math.random().toString(36).substr(2, 9); // 改进 ID 生成，避免重复
             const messageData = {
                 type: 'message',
                 content: encrypted,
                 nickname: nickname,
                 avatar: avatar,
                 timestamp: Date.now(),
-                id: messageId // 添加消息 ID 用于去重
+                id: messageId
             };
             if (!messageIds.has(messageId)) {
                 messageIds.add(messageId);
                 client.publish(`/chat/${roomKey}`, JSON.stringify(messageData), { qos: 1 });
                 addMessage(content, nickname, true, avatar);
-                $('#message-input').val(''); // 清空输入框
+                $('#message-input').val('');
             }
         }
     }
@@ -132,15 +129,10 @@ $(document).ready(function() {
         client.on('connect', () => {
             console.log('MQTT 连接成功');
             client.subscribe(`/chat/${roomKey}`, { qos: 1 });
-            const joinData = {
-                type: 'join',
-                nickname: nickname,
-                avatar: avatar,
-                timestamp: Date.now()
-            };
+            const joinData = { type: 'join', nickname, avatar, timestamp: Date.now() };
             client.publish(`/chat/${roomKey}`, JSON.stringify(joinData), { qos: 1 });
             addSystemMessage('已连接到 WeTalk');
-            broadcastUserList(); // 初始广播用户列表
+            broadcastUserList();
         });
 
         client.on('message', (topic, message) => {
@@ -148,7 +140,7 @@ $(document).ready(function() {
                 const data = JSON.parse(message.toString());
                 if (topic === `/chat/${roomKey}`) {
                     if (data.type === 'message' && data.nickname !== nickname && data.id && !messageIds.has(data.id)) {
-                        messageIds.add(data.id); // 记录消息 ID
+                        messageIds.add(data.id);
                         const decrypted = decrypt(data.content, roomKey);
                         addMessage(decrypted, data.nickname, false, data.avatar || avatar);
                     } else if (data.type === 'join' && data.nickname !== nickname) {
@@ -164,20 +156,14 @@ $(document).ready(function() {
                             broadcastUserList();
                         }
                     } else if (data.type === 'typing') {
-                        if (data.isTyping && data.nickname !== nickname) {
-                            typingUsers.add(data.nickname);
-                        } else if (!data.isTyping && data.nickname !== nickname) {
-                            typingUsers.delete(data.nickname);
-                        }
+                        if (data.isTyping && data.nickname !== nickname) typingUsers.add(data.nickname);
+                        else if (!data.isTyping && data.nickname !== nickname) typingUsers.delete(data.nickname);
                         updateTypingIndicator();
                     } else if (data.type === 'image' && data.nickname !== nickname && data.id && !messageIds.has(data.id)) {
-                        messageIds.add(data.id); // 记录图片消息 ID
+                        messageIds.add(data.id);
                         addImageMessage(data.url, data.nickname, false, data.avatar || avatar);
                     } else if (data.type === 'userlist') {
-                        users = data.users.reduce((acc, user) => {
-                            acc[user.nickname] = user.avatar || avatar;
-                            return acc;
-                        }, {});
+                        users = data.users.reduce((acc, user) => (acc[user.nickname] = user.avatar || avatar, acc), {});
                         updateOnlineUsers();
                     }
                 }
@@ -188,6 +174,7 @@ $(document).ready(function() {
 
         client.on('close', () => {
             addSystemMessage('连接断开，正在重连...');
+            reconnectMQTT();
         });
 
         client.on('error', (err) => {
@@ -197,23 +184,36 @@ $(document).ready(function() {
 
         $(window).on('beforeunload', function() {
             if (client && client.connected) {
-                const leaveData = {
-                    type: 'leave',
-                    nickname: nickname,
-                    timestamp: Date.now()
-                };
+                const leaveData = { type: 'leave', nickname, timestamp: Date.now() };
                 client.publish(`/chat/${roomKey}`, JSON.stringify(leaveData), { qos: 1 });
             }
         });
     }
 
+    // 重连逻辑
+    function reconnectMQTT() {
+        if (nickname && roomKey && !client.connected) {
+            client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+                username: roomKey,
+                clientId: `client_${nickname}_${Date.now()}`,
+                protocolVersion: 4,
+                reconnectPeriod: 1000
+            });
+            client.on('connect', () => {
+                console.log('MQTT 重连成功');
+                client.subscribe(`/chat/${roomKey}`, { qos: 1 });
+                const joinData = { type: 'join', nickname, avatar, timestamp: Date.now() };
+                client.publish(`/chat/${roomKey}`, JSON.stringify(joinData), { qos: 1 });
+                addSystemMessage('已重新连接到 WeTalk');
+                broadcastUserList();
+            });
+        }
+    }
+
     // 广播用户列表
     function broadcastUserList() {
         if (client && client.connected) {
-            const userList = {
-                type: 'userlist',
-                users: Object.keys(users).map(n => ({ nickname: n, avatar: users[n] }))
-            };
+            const userList = { type: 'userlist', users: Object.keys(users).map(n => ({ nickname: n, avatar: users[n] })) };
             client.publish(`/chat/${roomKey}`, JSON.stringify(userList), { qos: 1 });
         }
     }
@@ -313,7 +313,7 @@ $(document).ready(function() {
     $('.online-users-toggle').click(function() {
         console.log('点击在线用户按钮');
         $('#online-users').toggle();
-        updateOnlineUsers(); // 确保每次打开时刷新
+        updateOnlineUsers();
     });
 
     $('.close-panel').click(function() {
@@ -349,7 +349,7 @@ $(document).ready(function() {
                     } else {
                         url = canvas.toDataURL('image/jpeg', quality);
                     }
-                    const messageId = Date.now() + '_' + nickname; // 唯一 ID
+                    const messageId = Date.now() + '_' + Math.random().toString(36).substr(2, 9); // 改进 ID 生成
                     if (!messageIds.has(messageId)) {
                         messageIds.add(messageId);
                         addImageMessage(url, nickname, true, avatar);
@@ -381,14 +381,108 @@ $(document).ready(function() {
         $('#image-preview-container').hide();
     });
 
-    // 图片查看
-    $(document).on('click', '.image-content', function() {
-        $('#viewer-image').attr('src', $(this).attr('src'));
+    // 图片查看和拖动
+    window.viewImage = function(url) {
+        const img = $('#viewer-image');
+        img.attr('src', url).data('zoom', 1).css({
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%) scale(1)'
+        });
         $('#image-viewer').show();
+        zoomLevel = 1;
+        updateZoom();
+        isDragging = false;
+        startX = startY = initialX = initialY = 0;
+    };
+
+    $('.zoom-in').click(function() {
+        zoomLevel += 0.2;
+        updateZoom();
+    });
+
+    $('.zoom-out').click(function() {
+        zoomLevel = Math.max(0.2, zoomLevel - 0.2);
+        updateZoom();
+    });
+
+    $('.download').click(function() {
+        const link = document.createElement('a');
+        link.href = $('#viewer-image').attr('src');
+        link.download = `image_${Date.now()}.png`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
     });
 
     $('#image-viewer-close').click(function() {
         $('#image-viewer').hide();
+        zoomLevel = 1;
+        updateZoom();
+    });
+
+    // 拖动功能优化
+    $('.draggable').on('mousedown touchstart', function(e) {
+        isDragging = true;
+        const touch = e.type === 'touchstart' ? e.originalEvent.touches[0] : e;
+        startX = touch.pageX;
+        startY = touch.pageY;
+        const img = $(this);
+        const offset = img.position();
+        initialX = offset.left;
+        initialY = offset.top;
+        img.css('cursor', 'grabbing');
+    });
+
+    $(document).on('mousemove touchmove', function(e) {
+        if (isDragging) {
+            const touch = e.type === 'touchmove' ? e.originalEvent.touches[0] : e;
+            const dx = touch.pageX - startX;
+            const dy = touch.pageY - startY;
+            const img = $('.draggable');
+            const newLeft = initialX + dx;
+            const newTop = initialY + dy;
+            // 边界检查，防止拖出屏幕
+            const viewWidth = $(window).width();
+            const viewHeight = $(window).height();
+            const imgWidth = img.width() * zoomLevel;
+            const imgHeight = img.height() * zoomLevel;
+            const boundedLeft = Math.max(0, Math.min(newLeft, viewWidth - imgWidth));
+            const boundedTop = Math.max(0, Math.min(newTop, viewHeight - imgHeight));
+            img.css({
+                left: boundedLeft,
+                top: boundedTop
+            });
+        }
+    });
+
+    $(document).on('mouseup touchend', function() {
+        if (isDragging) {
+            isDragging = false;
+            $('.draggable').css('cursor', 'move');
+        }
+    });
+
+    function updateZoom() {
+        const img = $('.draggable');
+        img.css('transform', `translate(-50%, -50%) scale(${zoomLevel})`);
+    }
+
+    // 移动端返回主页
+    $('.back-arrow').click(function() {
+        if (window.innerWidth <= 768 && client && client.connected) {
+            const leaveData = { type: 'leave', nickname, timestamp: Date.now() };
+            client.publish(`/chat/${roomKey}`, JSON.stringify(leaveData), { qos: 1 });
+            client.end(); // 断开连接
+            $('#chat').hide();
+            $('#login').show();
+            $('#message-input').val('');
+            users = {};
+            messageIds.clear();
+            typingUsers.clear();
+            $('#messages').empty();
+            reconnectMQTT();
+        }
     });
 
     // 打字事件
@@ -396,30 +490,16 @@ $(document).ready(function() {
     $('#message-input').on('input', function() {
         clearTimeout(typingTimer);
         if (client && client.connected) {
-            client.publish(`/chat/${roomKey}`, JSON.stringify({
-                type: 'typing',
-                isTyping: true,
-                nickname: nickname
-            }), { qos: 1 });
+            client.publish(`/chat/${roomKey}`, JSON.stringify({ type: 'typing', isTyping: true, nickname }), { qos: 1 });
             typingTimer = setTimeout(() => {
-                client.publish(`/chat/${roomKey}`, JSON.stringify({
-                    type: 'typing',
-                    isTyping: false,
-                    nickname: nickname
-                }), { qos: 1 });
+                client.publish(`/chat/${roomKey}`, JSON.stringify({ type: 'typing', isTyping: false, nickname }), { qos: 1 });
             }, 2000);
         }
     });
 
     // 防止XSS攻击的HTML转义
     function escapeHtml(text) {
-        const map = {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#039;'
-        };
-        return text.replace(/[&<>"']/g, function(m) { return map[m]; });
+        const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+        return text.replace(/[&<>"']/g, m => map[m]);
     }
 });
